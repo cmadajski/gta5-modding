@@ -4,9 +4,14 @@ This is just a general purpose repo for using AI agents to screw around with GTA
 
 Some concepts I would like to experiment with:
 
-- [ ] per-object motion blur
+- [x] per-object motion blur prototype using native FSR motion vectors
 - [ ] Deus Ex-style augmentation system
 - [ ] fine-tuned speed adjustment using the scroll wheel (for PC players who don't have the same freedom as joystick systems)
+
+## Projects
+
+- [ReShade native motion blur and vector diagnostics](reshade/README.md): implementation, build instructions, installation, and test reports.
+- [Modding research](reshade/docs/modding-research.md): graphics inspection tools and gameplay API options.
 
 ## Clone the Repo (HTTPS)
 

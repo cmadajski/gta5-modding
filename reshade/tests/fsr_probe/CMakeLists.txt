@@ -1,0 +1,22 @@
+add_library(native_motion_test_fidelityfx MODULE mock_provider.cpp)
+set_target_properties(native_motion_test_fidelityfx PROPERTIES PREFIX "" OUTPUT_NAME "amd_fidelityfx_dx12")
+
+add_executable(native_motion_fsr_probe_tests probe_tests.cpp "${PROJECT_SOURCE_DIR}/src/fsr_probe.cpp")
+target_include_directories(native_motion_fsr_probe_tests PRIVATE "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(native_motion_fsr_probe_tests PRIVATE native_motion_minhook)
+add_dependencies(native_motion_fsr_probe_tests native_motion_test_fidelityfx)
+
+foreach(target IN ITEMS native_motion_test_fidelityfx native_motion_fsr_probe_tests)
+    target_compile_features(${target} PRIVATE cxx_std_20)
+    target_compile_definitions(${target} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_include_directories(${target} SYSTEM PRIVATE "${native_motion_fidelityfx_include}")
+    if(MSVC)
+        set_target_properties(${target} PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    elseif(MINGW)
+        target_link_options(${target} PRIVATE -static)
+    endif()
+endforeach()
+
+if(NOT CMAKE_CROSSCOMPILING OR CMAKE_CROSSCOMPILING_EMULATOR)
+    add_test(NAME native_motion_fsr_probe_tests COMMAND native_motion_fsr_probe_tests)
+endif()

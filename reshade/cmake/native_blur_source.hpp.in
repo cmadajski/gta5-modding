@@ -1,0 +1,2 @@
+#pragma once
+inline constexpr char native_blur_source[] = R"NativeBlur(@native_blur_hlsl@)NativeBlur";
