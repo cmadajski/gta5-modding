@@ -81,6 +81,13 @@ uniform int NativeMotionBlurDisplay <
     ui_tooltip = "Split comparison shows the scene on the left and the effect on the right.";
 >;
 
+uniform int NativeMotionWheelPath <
+    ui_type = "combo";
+    ui_label = "Wheel blur path";
+    ui_items = "Circular arcs\0Straight comparison\0";
+    ui_tooltip = "Circular arcs follow the wheel's projected rotation and preserve depth-tested coverage.";
+>;
+
 void NativeMotionBlurVS(uint id : SV_VertexID, out float4 position : SV_Position, out float2 uv : TEXCOORD0)
 {
     uv = float2(id == 2 ? 2.0 : 0.0, id == 1 ? 2.0 : 0.0);

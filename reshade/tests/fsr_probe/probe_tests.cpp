@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <initializer_list>
 #include <windows.h>
 #include <ffx_api/dx12/ffx_api_dx12.h>
 #include <ffx_api/ffx_upscale.h>
@@ -30,8 +31,8 @@ Function load_export(HMODULE library, const char *name)
 struct MockTexture final : ID3D12Resource
 {
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void **) override { return E_NOINTERFACE; }
-    ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
-    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+    ULONG STDMETHODCALLTYPE AddRef() override { ++add_refs; return 1; }
+    ULONG STDMETHODCALLTYPE Release() override { ++releases; return 1; }
     HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT *, void *) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void *) override { return E_NOTIMPL; }
     HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown *) override { return E_NOTIMPL; }
@@ -63,6 +64,7 @@ struct MockTexture final : ID3D12Resource
     }
 
     D3D12_RESOURCE_DESC description{};
+    unsigned add_refs = 0, releases = 0;
 };
 
 unsigned (*provider_dispatch_count)();
@@ -91,6 +93,13 @@ void post_dispatch(const fsr_probe::Sample &sample) noexcept
 int main()
 {
     using fsr_probe::InstallResult;
+    static_assert(fsr_probe::depth_srv_format(DXGI_FORMAT_R32_TYPELESS) == DXGI_FORMAT_R32_FLOAT);
+    static_assert(fsr_probe::depth_srv_format(DXGI_FORMAT_R32_FLOAT) == DXGI_FORMAT_R32_FLOAT);
+    static_assert(fsr_probe::depth_srv_format(DXGI_FORMAT_R32G8X24_TYPELESS) == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS);
+    static_assert(fsr_probe::depth_srv_format(DXGI_FORMAT_D32_FLOAT) == DXGI_FORMAT_UNKNOWN);
+    static_assert(fsr_probe::depth_srv_format(DXGI_FORMAT_D32_FLOAT_S8X24_UINT) == DXGI_FORMAT_UNKNOWN);
+    static_assert(fsr_probe::depth_srv_format(DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS) == DXGI_FORMAT_UNKNOWN);
+    static_assert(fsr_probe::depth_srv_format(DXGI_FORMAT_X32_TYPELESS_G8X24_UINT) == DXGI_FORMAT_UNKNOWN);
     check(fsr_probe::try_install(capture) == InstallResult::waiting_for_module, "Wait for the provider to load");
     check(fsr_probe::try_install(capture, true) == InstallResult::waiting_for_module,
           "Do not preload the provider outside GTA V Enhanced");
@@ -108,7 +117,8 @@ int main()
     settings.header.pNext = &dx12.header;
     settings.maxUpscaleSize = {1920, 1080};
     settings.flags = FFX_UPSCALE_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS |
-                     FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION;
+                     FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION |
+                     FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
     ffxContext context = nullptr;
     check(create(&context, &settings.header, nullptr) == FFX_API_RETURN_OK, "Create a context before attachment");
     check(fsr_probe::try_install(capture, false, post_dispatch) == InstallResult::installed, "Attach the probe");
@@ -124,6 +134,10 @@ int main()
     MockTexture output;
     output.description = motion.description;
     output.description.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    MockTexture depth;
+    depth.description = motion.description;
+    depth.description.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
+    depth.description.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
     int command_token = 0;
     ffxDispatchDescUpscale frame{};
     frame.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
@@ -131,6 +145,9 @@ int main()
     frame.motionVectors.resource = &motion;
     frame.motionVectors.description.type = FFX_API_RESOURCE_TYPE_TEXTURE2D;
     frame.motionVectors.state = FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ;
+    frame.depth.resource = &depth;
+    frame.depth.description.type = FFX_API_RESOURCE_TYPE_TEXTURE2D;
+    frame.depth.state = FFX_API_RESOURCE_STATE_COMPUTE_READ;
     frame.output.resource = &output;
     frame.output.description.type = FFX_API_RESOURCE_TYPE_TEXTURE2D;
     frame.output.state = FFX_API_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -185,6 +202,17 @@ int main()
               latest_post_sample.output_texture.Format == DXGI_FORMAT_R16G16B16A16_FLOAT &&
               latest_post_sample.output_texture.Width == 1920 && latest_post_sample.output_texture.Height == 1080,
           "Publish the native output only after the original dispatch");
+    for (const auto *sample : {&latest_sample, &latest_post_sample})
+        check(sample->depth_valid && sample->depth == &depth && sample->depth_inverted &&
+                  sample->depth_identity == reinterpret_cast<std::uintptr_t>(&depth) &&
+                  sample->depth_ffx_type == FFX_API_RESOURCE_TYPE_TEXTURE2D &&
+                  sample->depth_ffx_state == FFX_API_RESOURCE_STATE_COMPUTE_READ &&
+                  sample->depth_state == D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE &&
+                  sample->depth_texture.Format == DXGI_FORMAT_R32G8X24_TYPELESS &&
+                  sample->depth_texture.Flags == D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL &&
+                  sample->depth_texture.Width == 1920 && sample->depth_texture.Height == 1080,
+              "Publish the original depth resource, state, texture description and inverted-depth flag");
+    check(depth.add_refs == 0 && depth.releases == 0, "Borrow the depth resource around a dispatch");
     check(latest_sample.source_state == (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
           "Translate the resource state");
     check(latest_sample.motion_vectors == &motion && latest_sample.command_list == static_cast<void *>(&command_token),
@@ -211,12 +239,20 @@ int main()
     frame.sharpness = 0.0f;
 
     output.description.Width = 1919;
+    depth.description.Width = 1279;
     check(dispatch(&context, &frame.header) == FFX_API_RETURN_OK && capture_count == 3 && post_count == 2 &&
               !latest_post_sample.output_valid && latest_post_sample.output == nullptr &&
               latest_post_sample.dispatch_id == first_dispatch_id + 2 && latest_post_sample.dispatch_id == latest_sample.dispatch_id &&
               fsr_probe::get_stats().unsupported_samples == 2,
           "Provide vector diagnostics and mark the undersized output unusable");
+    check(!latest_sample.depth_valid && latest_sample.depth == nullptr && !latest_post_sample.depth_valid &&
+              latest_post_sample.depth == nullptr && latest_post_sample.depth_inverted &&
+              latest_post_sample.depth_identity == reinterpret_cast<std::uintptr_t>(&depth) &&
+              latest_sample.depth_texture.Width == 1279 && latest_post_sample.depth_texture.Width == 1279 &&
+              latest_post_sample.depth_texture.Format == DXGI_FORMAT_R32G8X24_TYPELESS,
+          "Preserve the observed native depth description when its extent is unusable");
     output.description.Width = 1920;
+    depth.description.Width = 1920;
     frame.output.state = FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ;
 
     auto old_handle = context;
@@ -224,12 +260,19 @@ int main()
     check(destroy(&context, nullptr) == FFX_API_RETURN_OK && context == nullptr, "Destroy the tracked context");
     check(dispatch(&old_handle, &frame.header) == FFX_API_RETURN_OK && capture_count == 3 && post_count == 2,
           "Stop publishing for a destroyed context");
+    settings.flags &= ~FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
+    frame.depth.state = FFX_API_RESOURCE_STATE_COMMON;
     check(create(&context, &settings.header, nullptr) == FFX_API_RETURN_OK && context == old_handle,
           "Create a new context with a recycled handle");
     check(dispatch(&context, &frame.header) == FFX_API_RETURN_OK && capture_count == 4 && post_count == 3 &&
               latest_sample.context_id != old_context_id && latest_post_sample.context_id == latest_sample.context_id &&
               latest_post_sample.output_valid && latest_post_sample.output_state == latest_sample.source_state,
           "Give the recycled handle its own identity and translate a shader-readable output state");
+    check(!latest_sample.depth_valid && latest_sample.depth == nullptr && !latest_post_sample.depth_valid &&
+              latest_post_sample.depth == nullptr && !latest_post_sample.depth_inverted &&
+              latest_post_sample.depth_ffx_state == FFX_API_RESOURCE_STATE_COMMON &&
+              latest_post_sample.depth_texture.Width == 1920,
+          "Keep unsupported depth state optional and preserve its raw state and native description");
 
     fsr_probe::stop_capture();
     check(dispatch(&context, &frame.header) == FFX_API_RETURN_OK && capture_count == 4 && post_count == 3,

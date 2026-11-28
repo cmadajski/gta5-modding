@@ -1,4 +1,5 @@
-add_executable(native_motion_blur_gpu_test gpu_test.cpp "${PROJECT_SOURCE_DIR}/src/native_blur.cpp")
+add_executable(native_motion_blur_gpu_test gpu_test.cpp "${PROJECT_SOURCE_DIR}/src/native_blur.cpp"
+    "${PROJECT_SOURCE_DIR}/src/wheel_mask.cpp")
 target_compile_features(native_motion_blur_gpu_test PRIVATE cxx_std_20)
 target_compile_definitions(native_motion_blur_gpu_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_include_directories(native_motion_blur_gpu_test PRIVATE

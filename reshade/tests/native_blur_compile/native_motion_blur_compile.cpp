@@ -37,6 +37,10 @@ bool check_shader_layout(ID3DBlob &bytecode)
     } bindings[] = {
         {"Scene", D3D_SIT_TEXTURE, 0},
         {"Motion", D3D_SIT_TEXTURE, 1},
+        {"WheelMask", D3D_SIT_TEXTURE, 2},
+        {"WheelDepth", D3D_SIT_TEXTURE, 3},
+        {"SceneDepth", D3D_SIT_TEXTURE, 4},
+        {"WheelData", D3D_SIT_STRUCTURED, 5},
         {"Result", D3D_SIT_UAV_RWTYPED, 0},
         {"SceneSampler", D3D_SIT_SAMPLER, 0},
         {"PointSampler", D3D_SIT_SAMPLER, 1},
@@ -44,7 +48,7 @@ bool check_shader_layout(ID3DBlob &bytecode)
     };
     D3D12_SHADER_DESC shader{};
     if (FAILED(reflection->GetDesc(&shader)) || shader.BoundResources != std::size(bindings) ||
-        shader.ConstantBuffers != 1) {
+        shader.ConstantBuffers != 2) {
         std::cerr << "Unexpected compute shader resource or cbuffer count\n";
         return false;
     }
@@ -79,13 +83,19 @@ bool check_shader_layout(ID3DBlob &bytecode)
         {"maxRadius", 40, 4, D3D_SVT_FLOAT},
         {"displayMode", 44, 4, D3D_SVT_UINT},
         {"motionTextureSize", 48, 8, D3D_SVT_UINT},
-        {"padding", 56, 8, D3D_SVT_UINT},
+        {"wheelMaskTextureSize", 56, 8, D3D_SVT_UINT},
+        {"arcEnabled", 64, 4, D3D_SVT_UINT},
+        {"arcFrame", 68, 4, D3D_SVT_UINT},
+        {"arcCount", 72, 4, D3D_SVT_UINT},
+        {"arcReserved", 76, 4, D3D_SVT_UINT},
+        {"jitterUV", 80, 8, D3D_SVT_FLOAT},
+        {"sceneDepthTextureSize", 88, 8, D3D_SVT_UINT},
     };
     auto *const buffer = reflection->GetConstantBufferByName("BlurConstants");
     D3D12_SHADER_BUFFER_DESC buffer_desc{};
-    if (FAILED(buffer->GetDesc(&buffer_desc)) || buffer_desc.Size != 64 ||
+    if (FAILED(buffer->GetDesc(&buffer_desc)) || buffer_desc.Size != 96 ||
         buffer_desc.Variables != std::size(constants)) {
-        std::cerr << "Expected 16 DWORDs of root constants\n";
+        std::cerr << "Expected 24 DWORDs of root constants\n";
         return false;
     }
     for (const auto &constant : constants) {

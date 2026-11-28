@@ -17,3 +17,5 @@ cp "$proton_files"/lib/vkd3d/x86_64-windows/libvkd3d{,-shader,-utils}-1.dll \
 WINEDLLOVERRIDES='d3d12=n,b;d3d12core=n,b;dxgi=n,b' \
   ctest --test-dir build-windows -R '^native_motion_blur_gpu_test$' --output-on-failure
 ```
+
+The raw capture checks use RG16F motion with inactive texture padding and row-pitch alignment. They require bit-exact signed zero and NaN payload preservation, active-viewport cropping, same-list scene-before readback, and capture-slot reuse after completed GPU work and recording replacement. Capture-only mode is checked with a reset frame and must leave the scene unchanged.

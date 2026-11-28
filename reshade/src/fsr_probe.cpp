@@ -190,6 +190,26 @@ bool read_sample(const ffxDispatchDescUpscale &desc, const Context &context, Sam
     sample.reset = desc.reset;
     sample.display_resolution_motion_vectors = (context.flags & FFX_UPSCALE_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS) != 0;
     sample.jitter_cancellation = (context.flags & FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION) != 0;
+    sample.depth_inverted = (context.flags & FFX_UPSCALE_ENABLE_DEPTH_INVERTED) != 0;
+    sample.depth_ffx_type = desc.depth.description.type;
+    sample.depth_ffx_state = desc.depth.state;
+    if (desc.depth.resource != nullptr)
+    {
+        auto *depth = static_cast<ID3D12Resource *>(desc.depth.resource);
+        sample.depth_identity = reinterpret_cast<std::uintptr_t>(depth);
+        sample.depth_texture = depth->GetDesc();
+        const auto &description = sample.depth_texture;
+        if (sample.depth_ffx_type == FFX_API_RESOURCE_TYPE_TEXTURE2D && source_state(sample.depth_ffx_state, sample.depth_state) &&
+            single_sample_texture_2d(description) && description.SampleDesc.Quality == 0 &&
+            sample.render_width <= description.Width &&
+            sample.render_height <= description.Height &&
+            (description.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) == 0 &&
+            depth_srv_format(description.Format) != DXGI_FORMAT_UNKNOWN)
+        {
+            sample.depth = depth;
+            sample.depth_valid = true;
+        }
+    }
 
     const auto vector_width = sample.display_resolution_motion_vectors ? sample.upscale_width : sample.render_width;
     const auto vector_height = sample.display_resolution_motion_vectors ? sample.upscale_height : sample.render_height;

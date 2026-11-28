@@ -6,6 +6,21 @@
 
 namespace fsr_probe
 {
+// Shader-readable format for depth plane 0 of the supported D3D12 textures.
+constexpr DXGI_FORMAT depth_srv_format(DXGI_FORMAT native_format) noexcept
+{
+    switch (native_format)
+    {
+    case DXGI_FORMAT_R32_TYPELESS:
+    case DXGI_FORMAT_R32_FLOAT:
+        return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+        return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    default:
+        return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
 struct Sample
 {
     ID3D12GraphicsCommandList *command_list;
@@ -26,6 +41,15 @@ struct Sample
     D3D12_RESOURCE_STATES output_state;
     D3D12_RESOURCE_DESC output_texture;
     bool output_valid;
+    ID3D12Resource *depth;
+    D3D12_RESOURCE_STATES depth_state;
+    // The observed layout and identity remain available even when depth is
+    // unusable. Only depth_valid authorizes use of the borrowed depth pointer.
+    D3D12_RESOURCE_DESC depth_texture;
+    std::uintptr_t depth_identity;
+    std::uint32_t depth_ffx_type, depth_ffx_state;
+    bool depth_valid;
+    bool depth_inverted;
 };
 
 // The pointers are borrowed for the duration of the callback. Record commands on

@@ -12,6 +12,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -20,6 +21,11 @@
 #include "fsr_probe.hpp"
 #include "native_motion_math.hpp"
 #include "native_blur.hpp"
+#include "wheel_trace.hpp"
+#include "wheel_runtime.hpp"
+#include "wheel_descriptors.hpp"
+#include "wheel_mask.hpp"
+#include "wheel_pipeline_hooks.hpp"
 
 using Microsoft::WRL::ComPtr;
 namespace api = reshade::api;
@@ -86,11 +92,28 @@ struct DeviceState
     bool blur_enabled = false;
     struct SceneCapture
     {
-        std::uint64_t sequence = 0, retirement = 0;
+        std::uint64_t sequence = 0, retirement = 0, recorded_present_interval = 0, submitted_present_interval = 0, captured_tick_ms = 0;
+        fsr_probe::Sample metadata{};
+        std::string stem;
         unsigned submissions = 0;
+        bool wheel = false, blur_applied = false;
+        bool wheel_correction_enabled = false, wheel_arcs_enabled = false;
+        std::uintptr_t wheel_source_depth = 0;
         bool final_saved = false, collected = false, recording_replaced = false;
     };
-    std::array<SceneCapture, 4> scene_captures;
+    std::array<SceneCapture, native_blur::Engine::capture_count> scene_captures;
+    unsigned wheel_remaining = 0;
+    std::uint64_t wheel_last_frame = UINT64_MAX, wheel_poll_time = 0, wheel_started = 0;
+    std::string wheel_prefix;
+    bool wheel_correction = false;
+    wheel_runtime::Frame wheel_frame;
+    std::uint64_t wheel_frame_command = 0;
+    unsigned wheel_frame_samples = 0, wheel_frame_submissions = 0;
+    bool wheel_interval_ambiguous = false;
+    std::shared_ptr<wheel_mask::Surface> wheel_surface, pending_wheel_surface;
+    std::array<std::uint64_t, 14> last_depth_layout{};
+    unsigned depth_layout_logs = 0;
+    std::uintptr_t last_fsr_depth_identity = 0;
 };
 
 std::recursive_mutex state_mutex;
@@ -102,6 +125,7 @@ struct CommandState
     bool reset_requested = false;
     api::command_queue *observed_queue = nullptr;
     bool mixed_queues = false;
+    std::uint64_t wheel_dispatch = 0;
 };
 std::unordered_map<std::uint64_t, CommandState> commands;
 std::atomic_uint64_t next_command{1};
@@ -125,8 +149,25 @@ std::uint64_t command_id(ID3D12GraphicsCommandList *command)
     return id;
 }
 
+void abandon_unsubmitted_wheel_frame(DeviceState &state, std::uint64_t command)
+{
+    if (state.wheel_frame_command == command && state.wheel_frame_submissions == 0)
+    {
+        state.wheel_frame.valid = false;
+        if (state.pending_wheel_surface) state.pending_wheel_surface->set_initialized(false);
+        state.pending_wheel_surface.reset();
+    }
+}
+
+void invalidate_wheel_mask(DeviceState &state)
+{
+    wheel_mask::invalidate_device(reinterpret_cast<ID3D12Device *>(state.device->get_native()));
+    if (state.pending_wheel_surface) state.pending_wheel_surface->set_initialized(false);
+}
+
 void replace_recording(DeviceState &state, std::uint64_t command)
 {
+    abandon_unsubmitted_wheel_frame(state, command);
     for (auto &previous : state.slots)
     {
         if (previous.command != command)
@@ -164,7 +205,16 @@ HRESULT STDMETHODCALLTYPE track_native_reset(ID3D12GraphicsCommandList *command,
         if (found != commands.end())
         {
             if (const auto device = devices.find(found->second.device); device != devices.end())
+            {
                 replace_recording(*device->second, id);
+                if (device->second->wheel_correction)
+                {
+                    wheel_trace::track_command(found->second.device, reinterpret_cast<std::uint64_t>(command));
+                    wheel_runtime::reset(reinterpret_cast<ID3D12Device *>(found->second.device->get_native()), command);
+                    wheel_trace::reset_command(found->second.device, reinterpret_cast<std::uint64_t>(command));
+                }
+            }
+            found->second.wheel_dispatch = 0;
             found->second.reset_requested = false;
         }
     }
@@ -386,6 +436,8 @@ void capture_sample(const fsr_probe::Sample &sample) noexcept
         slot->metadata = sample;
         slot->metadata.motion_vectors = nullptr; // Borrowed pointers never escape the callback.
         slot->metadata.command_list = nullptr;
+        slot->metadata.output = nullptr;
+        slot->metadata.depth = nullptr;
         slot->pixel_scale = *scale;
         slot->command = command;
         slot->sequence = ++state.sequence;
@@ -424,12 +476,86 @@ void blur_after_upscale(const fsr_probe::Sample &sample) noexcept
         if (found == devices.end())
             return;
         auto &state = *found->second;
+        if (state.wheel_correction)
+        {
+            state.last_fsr_depth_identity = sample.depth_identity;
+            const auto &depth = sample.depth_texture;
+            const std::array<std::uint64_t, 14> depth_layout{sample.context_id, sample.depth_identity,
+                sample.depth_ffx_type, sample.depth_ffx_state,
+                unsigned(depth.Format), unsigned(depth.Dimension), depth.Width, depth.Height, depth.MipLevels,
+                depth.DepthOrArraySize, depth.SampleDesc.Count, depth.SampleDesc.Quality, unsigned(depth.Flags), sample.depth_valid};
+            if (state.depth_layout_logs < 16 && state.last_depth_layout != depth_layout)
+            {
+                state.last_depth_layout = depth_layout;
+                ++state.depth_layout_logs;
+                char message[384];
+                std::snprintf(message, sizeof(message),
+                    "[NativeWheelArc] FSR depth: dispatch=%llu resource=%llx valid=%u inverted=%u format=%u dimension=%u width=%llu height=%u mips=%u array=%u samples=%u quality=%u flags=0x%x ffx_type=%u ffx_state=0x%x native_state=0x%x render=%ux%u",
+                    static_cast<unsigned long long>(sample.dispatch_id), static_cast<unsigned long long>(sample.depth_identity),
+                    unsigned(sample.depth_valid), unsigned(sample.depth_inverted), unsigned(depth.Format), unsigned(depth.Dimension),
+                    static_cast<unsigned long long>(depth.Width), depth.Height, unsigned(depth.MipLevels), unsigned(depth.DepthOrArraySize),
+                    depth.SampleDesc.Count, depth.SampleDesc.Quality, unsigned(depth.Flags), sample.depth_ffx_type, sample.depth_ffx_state,
+                    unsigned(sample.depth_state), sample.render_width, sample.render_height);
+                log(message);
+            }
+            ++state.wheel_frame_samples;
+            state.wheel_frame_command = command;
+            tracked->second.wheel_dispatch = sample.dispatch_id;
+            state.wheel_frame_submissions = 0;
+            state.pending_wheel_surface.reset();
+            state.wheel_frame = {
+                .frame_id = state.frames,
+                .dispatch_id = sample.dispatch_id,
+                .context_id = sample.context_id,
+                .motion_rt = sample.motion_vectors,
+                .render_width = sample.render_width, .render_height = sample.render_height,
+                .upscale_width = sample.upscale_width, .upscale_height = sample.upscale_height,
+                .jitter_x = sample.jitter_x, .jitter_y = sample.jitter_y,
+                .valid = sample.output_valid && !sample.display_resolution_motion_vectors && state.present_thread != 0 &&
+                    tracked->second.observed_queue == state.queue && !tracked->second.mixed_queues &&
+                    sample.command_list->GetType() == D3D12_COMMAND_LIST_TYPE_DIRECT,
+                .reset = sample.reset, .jitter_cancellation = sample.jitter_cancellation,
+            };
+        }
         // Shared scratch is only valid on our observed, serial graphics queue.
         // New lists remain diagnostic-only until their first observed submit.
-        if (!state.blur_enabled || !state.prehud || !state.runtime || state.queue_mismatch ||
+        if (!state.prehud || !state.runtime || state.queue_mismatch ||
             tracked->second.observed_queue != state.queue || tracked->second.mixed_queues ||
-            sample.command_list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT ||
-            !math::blur_sample_valid(sample.frame_time_ms, sample.reset, sample.jitter_cancellation))
+            sample.command_list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT)
+            return;
+        auto controls = state.blur_controls;
+        const float exposure = controls.exposure_mode == 1 ? controls.shutter_ms : controls.shutter_angle;
+        controls.enabled = state.blur_enabled && math::blur_sample_valid(sample.frame_time_ms, sample.reset, sample.jitter_cancellation) &&
+            std::isfinite(exposure) && exposure > 0.f && std::isfinite(controls.max_radius) && controls.max_radius > 0.f;
+        controls.wheel_arcs = controls.wheel_arcs && controls.enabled;
+
+        std::shared_ptr<wheel_mask::Surface> arc_surface;
+        native_blur::WheelArcInputs arc_inputs;
+        if (state.wheel_correction && state.wheel_frame.valid && state.wheel_frame_samples == 1 &&
+            sample.depth_valid && sample.depth && sample.motion_vectors &&
+            sample.render_width <= sample.depth_texture.Width && sample.render_height <= sample.depth_texture.Height)
+        {
+            auto *native_device = reinterpret_cast<ID3D12Device *>(state.device->get_native());
+            arc_surface = wheel_trace::prepare_wheel_surface(state.device, sample, controls.wheel_arcs);
+            if (arc_surface && (arc_surface->reverse_z() != sample.depth_inverted ||
+                sample.render_width > arc_surface->width() || sample.render_height > arc_surface->height()))
+                arc_surface.reset();
+            if (arc_surface)
+            {
+                if (state.wheel_surface != arc_surface)
+                {
+                    // Readiness belongs to the original wheel attachment;
+                    // the FSR depth copies can alternate independently.
+                    state.wheel_surface = arc_surface;
+                }
+                const auto pool = wheel_runtime::arc_pool(native_device);
+                arc_inputs = {arc_surface.get(), pool.resource, pool.element_count,
+                    state.frames <= UINT32_MAX ? static_cast<std::uint32_t>(state.frames) : 0};
+            }
+        }
+        if (!arc_surface || !controls.wheel_arcs)
+            invalidate_wheel_mask(state);
+        if (!state.blur_enabled && state.wheel_remaining == 0 && !arc_surface)
             return;
         Slot *captured = nullptr;
         for (auto &slot : state.slots)
@@ -438,34 +564,94 @@ void blur_after_upscale(const fsr_probe::Sample &sample) noexcept
                 slot.metadata.dispatch_id == sample.dispatch_id &&
                 (captured == nullptr || slot.sequence > captured->sequence))
                 captured = &slot;
-        if (captured == nullptr)
+        if (captured == nullptr && !arc_surface)
             return;
+        if (captured == nullptr)
+            controls.enabled = controls.wheel_arcs = false;
         unsigned capture_index = 0;
+        bool wheel_capture = false;
         constexpr std::array<std::uint64_t, 4> milestones{600, 3000, 7000, 13000};
-        if (blur_verification_requested())
+        if (captured && state.wheel_remaining != 0 && state.wheel_last_frame != state.frames)
+        {
+            capture_index = 5 + (4 - state.wheel_remaining);
+            wheel_capture = true;
+        }
+        else if (controls.enabled && blur_verification_requested())
             for (unsigned i = 0; i < milestones.size(); ++i)
                 if (state.scene_captures[i].sequence == 0 && state.blur_frames >= milestones[i])
                 {
                     capture_index = i + 1;
                     break;
                 }
+        if (capture_index != 0 && state.prehud->capture_recorded(capture_index))
+        {
+            capture_index = 0;
+            wheel_capture = false;
+        }
+        if (!controls.enabled && capture_index == 0 && !arc_surface)
+            return;
+        DeviceState::SceneCapture pending;
+        if (capture_index != 0)
+        {
+            // Allocate strings before recording GPU work, so an allocation failure
+            // cannot orphan a pending readback or associate it with a later frame.
+            pending.sequence = captured->sequence;
+            pending.recorded_present_interval = state.frames;
+            pending.captured_tick_ms = GetTickCount64();
+            pending.metadata = sample;
+            pending.metadata.command_list = nullptr;
+            pending.metadata.motion_vectors = nullptr;
+            pending.metadata.output = nullptr;
+            pending.metadata.depth = nullptr;
+            pending.wheel = wheel_capture;
+            pending.wheel_correction_enabled = state.wheel_correction;
+            char suffix[32];
+            std::snprintf(suffix, sizeof(suffix), wheel_capture ? "-%02u" : "NativePreHUD-%02u",
+                wheel_capture ? capture_index - 4 : capture_index);
+            pending.stem = wheel_capture ? state.wheel_prefix + suffix : suffix;
+        }
         // Use the original command list with native descriptor heaps. Passing
         // these heaps through ReShade's proxy would invoke its proxy unwrap ABI.
         auto *native_command = reinterpret_cast<ID3D12GraphicsCommandList *>(tracked->second.list->get_native());
-        if (!state.prehud->record(native_command, sample,
-                reinterpret_cast<ID3D12Resource *>(captured->texture.handle),
-                static_cast<unsigned>(captured - state.slots.data()), state.blur_controls, capture_index))
-            return;
-        ++state.blur_frames;
+        const auto record = [&] {
+            return state.prehud->record(native_command, sample,
+                captured ? reinterpret_cast<ID3D12Resource *>(captured->texture.handle) : nullptr,
+                captured ? static_cast<unsigned>(captured - state.slots.data()) : 0,
+                controls, capture_index, arc_surface ? &arc_inputs : nullptr);
+        };
+        if (!record())
+        {
+            // A failed record emits no GPU commands. The diagnostics and mask
+            // clear can still run when the blur compute setup fails.
+            if ((!wheel_capture && !arc_surface) || !controls.enabled) return;
+            controls.enabled = controls.wheel_arcs = false;
+            if (!record()) return;
+        }
+        state.pending_wheel_surface = arc_surface;
+        if (controls.enabled) ++state.blur_frames;
         if (capture_index != 0)
         {
+            pending.blur_applied = controls.enabled;
+            pending.wheel_arcs_enabled = controls.wheel_arcs && arc_surface && arc_surface->initialized() &&
+                arc_inputs.parameters && arc_inputs.parameter_count != 0 && arc_inputs.frame_id != 0;
+            pending.wheel_source_depth = arc_surface ? reinterpret_cast<std::uintptr_t>(arc_surface->scene_depth()) : 0;
             auto &capture = state.scene_captures[capture_index - 1];
-            capture.sequence = captured->sequence;
+            capture = std::move(pending);
             if (!state.prehud->capture_recorded(capture_index))
             {
                 capture.collected = capture.final_saved = true;
+                if (wheel_capture) state.wheel_remaining = 0;
                 warn("[NativeBlurPreHUD] Optional scene capture allocation failed; no paired capture claimed.");
                 return;
+            }
+            if (wheel_capture)
+            {
+                state.wheel_last_frame = state.frames;
+                --state.wheel_remaining;
+                capture.final_saved = true; // Exact pre-HUD scene is already captured; no composited screenshot needed.
+                auto trace_sample = sample;
+                trace_sample.command_list = native_command;
+                wheel_trace::observe_fsr(state.device, trace_sample);
             }
             char message[160];
             std::snprintf(message, sizeof(message), "[NativeBlurPreHUD] capture=%u sequence=%llu recorded before/after FSR output.",
@@ -501,6 +687,7 @@ void on_init_device(api::device *device)
 {
     if (device->get_api() != api::device_api::d3d12)
         return;
+    wheel_trace::init_device(device);
     {
         const std::lock_guard lock(state_mutex);
         auto state = std::make_unique<DeviceState>();
@@ -513,6 +700,17 @@ void on_init_device(api::device *device)
     }
     log("[NativeMotion] D3D12 device detected. Waiting for amd_fidelityfx_dx12.dll and a tracked FSR context.");
     poll_probe(true);
+    if (wheel_trace::correction_requested())
+    {
+        auto *native = reinterpret_cast<ID3D12Device *>(device->get_native());
+        const bool descriptors = wheel_descriptors::init(native);
+        const bool pipelines = wheel_pipeline_hooks::init(native);
+        const std::lock_guard lock(state_mutex);
+        devices.at(device)->wheel_correction = descriptors && pipelines;
+        log(descriptors && pipelines
+            ? "[NativeWheelBlur] Native descriptor and wheel pipeline tracking enabled."
+            : "[NativeWheelBlur] Native tracking unavailable; wheel correction disabled.");
+    }
 }
 
 void on_init_command_list(api::command_list *command)
@@ -525,6 +723,12 @@ void on_init_command_list(api::command_list *command)
     {
         const std::lock_guard lock(state_mutex);
         commands[id] = {command->get_device(), command};
+    }
+    if (wheel_trace::correction_requested())
+    {
+        install_native_reset_hook(command);
+        if (command_id(native) == id && native_reset_target(native) == installed_reset_target.load(std::memory_order_acquire))
+            wheel_trace::track_command(command->get_device(), reinterpret_cast<std::uint64_t>(native));
     }
 }
 
@@ -555,7 +759,12 @@ void discard_recording(api::command_list *command, bool destroy)
             found->second.reset_requested = true;
     }
     if (destroy)
+    {
+        if (const auto device = devices.find(command->get_device()); device != devices.end())
+            abandon_unsubmitted_wheel_frame(*device->second, id);
+        wheel_runtime::destroy_command(reinterpret_cast<ID3D12Device *>(command->get_device()->get_native()), native);
         commands.erase(id);
+    }
 }
 void on_reset_command_list(api::command_list *command) { discard_recording(command, false); }
 void on_destroy_command_list(api::command_list *command) { discard_recording(command, true); }
@@ -576,6 +785,30 @@ void on_execute(api::command_queue *queue, api::command_list *command)
     if (found == devices.end())
         return;
     auto &state = *found->second;
+    if (state.wheel_correction)
+    {
+        const auto tracked = commands.find(id);
+        if (tracked != commands.end() && tracked->second.wheel_dispatch != 0)
+        {
+            if (state.wheel_frame_samples != 0 && state.wheel_frame_command == id &&
+                state.wheel_frame.dispatch_id == tracked->second.wheel_dispatch)
+            {
+                ++state.wheel_frame_submissions;
+                if (queue != state.queue || GetCurrentThreadId() != state.present_thread)
+                {
+                    state.wheel_frame.valid = false;
+                    if (state.pending_wheel_surface)
+                    {
+                        invalidate_wheel_mask(state);
+                        if (!state.queue_mismatch)
+                            warn("[NativeWheelArc] Mask clear submitted on a different queue or presentation thread. Arc capture stopped.");
+                        state.queue_mismatch = true;
+                    }
+                }
+            }
+            else state.wheel_interval_ambiguous = true;
+        }
+    }
     for (auto &slot : state.slots)
     {
         if (slot.command != id || slot.recording_replaced || slot.phase == Phase::free || slot.phase == Phase::quarantined)
@@ -591,8 +824,12 @@ void on_execute(api::command_queue *queue, api::command_list *command)
         {
             slot.phase = Phase::submitted;
             for (auto &capture : state.scene_captures)
-                if (capture.sequence == slot.sequence && ++capture.submissions == 2)
-                    warn("[NativeBlurPreHUD] Captured recording replayed; composed screenshot is not a guaranteed same-frame match.");
+                if (capture.sequence == slot.sequence)
+                {
+                    capture.submitted_present_interval = state.frames;
+                    if (++capture.submissions == 2)
+                        warn("[NativeBlurPreHUD] Captured recording replayed; composed screenshot is not a guaranteed same-frame match.");
+                }
         }
     }
 }
@@ -616,6 +853,16 @@ void on_init_runtime(api::effect_runtime *runtime)
     state.runtime = runtime;
     state.queue = runtime->get_command_queue();
     state.binding_dirty = true;
+    if (state.wheel_correction && !state.queue_mismatch)
+    {
+        state.wheel_correction = wheel_runtime::init(
+            reinterpret_cast<ID3D12Device *>(state.device->get_native()),
+            reinterpret_cast<ID3D12CommandQueue *>(state.queue->get_native()));
+        wheel_trace::set_correction_active(state.device, state.wheel_correction);
+        log(state.wheel_correction
+            ? "[NativeWheelBlur] Experimental rigid-wheel correction enabled on the presentation queue."
+            : "[NativeWheelBlur] Submission tracking unavailable; wheel correction disabled.");
+    }
     log("[NativeMotion] Runtime attached. Enable NativeMotionBlur.fx for blur or NativeMotionVectors.fx for diagnostics in ReShade.");
 }
 
@@ -783,6 +1030,11 @@ void refresh_blur_controls(DeviceState &state)
     read_int("NativeMotionBlurExposureMode", controls.exposure_mode);
     read_int("NativeMotionBlurSamples", controls.samples);
     read_int("NativeMotionBlurDisplay", controls.display);
+    int wheel_path = 0;
+    const auto wheel_path_uniform = find_uniform(runtime, "NativeMotionWheelPath", blur_effect_file);
+    if (wheel_path_uniform.handle != 0)
+        runtime->get_uniform_value_int(wheel_path_uniform, &wheel_path, 1);
+    controls.wheel_arcs = wheel_path == 0;
     read_float("NativeMotionBlurShutterAngle", controls.shutter_angle);
     read_float("NativeMotionBlurShutterMs", controls.shutter_ms);
     read_float("NativeMotionBlurMaxRadiusPx", controls.max_radius);
@@ -791,6 +1043,63 @@ void refresh_blur_controls(DeviceState &state)
         log(enabled ? "[NativeBlurPreHUD] Enabled: scene blur after FSR, before HUD."
                     : "[NativeBlurPreHUD] Disabled or controls unavailable; no post-HUD fallback.");
     state.blur_enabled = enabled;
+    if (!enabled || !controls.wheel_arcs)
+        invalidate_wheel_mask(state);
+}
+
+std::filesystem::path capture_directory()
+{
+    wchar_t executable[32768]{};
+    const auto length = GetModuleFileNameW(nullptr, executable, static_cast<DWORD>(std::size(executable)));
+    if (length == 0 || length >= std::size(executable))
+        throw std::runtime_error("Executable path unavailable");
+    return std::filesystem::path(executable).parent_path() / L"NativeMotionCaptures";
+}
+
+// A file trigger lets the host request a burst without synthesizing game input.
+// Ctrl+F6 is also available through ReShade's own focused-window input state.
+void poll_wheel_capture(DeviceState &state) noexcept
+{
+    try
+    {
+        const auto now = GetTickCount64();
+        bool requested = state.runtime->is_key_down(VK_CONTROL) && state.runtime->is_key_pressed(VK_F6);
+        if (now - state.wheel_poll_time >= 500)
+        {
+            state.wheel_poll_time = now;
+            std::error_code error;
+            requested |= std::filesystem::remove(capture_directory() / L"CaptureWheel.request", error);
+        }
+        if (state.wheel_remaining != 0 && now - state.wheel_started > 15000)
+        {
+            state.wheel_remaining = 0;
+            warn("[NativeWheelCapture] Burst timed out waiting for eligible FSR samples; only completed captures will be saved.");
+        }
+        if (!requested) return;
+        bool busy = state.wheel_remaining != 0;
+        for (unsigned i = 4; i < state.scene_captures.size(); ++i)
+            busy |= state.scene_captures[i].sequence != 0 && !state.scene_captures[i].collected;
+        if (busy)
+        {
+            warn("[NativeWheelCapture] Previous burst is still awaiting GPU completion/recording replacement; request ignored.");
+            return;
+        }
+        FILETIME stamp{};
+        GetSystemTimeAsFileTime(&stamp);
+        const auto time = (static_cast<std::uint64_t>(stamp.dwHighDateTime) << 32) | stamp.dwLowDateTime;
+        char prefix[96];
+        std::snprintf(prefix, sizeof(prefix), "NativeWheel-%llu-%lu-%llu",
+            static_cast<unsigned long long>(time), static_cast<unsigned long>(GetCurrentProcessId()),
+            static_cast<unsigned long long>(state.frames));
+        state.wheel_prefix = prefix;
+        for (unsigned i = 4; i < state.scene_captures.size(); ++i) state.scene_captures[i] = {};
+        state.wheel_remaining = 4;
+        state.wheel_last_frame = UINT64_MAX;
+        state.wheel_started = now;
+        wheel_trace::arm(state.device, 4, state.last_fsr_depth_identity);
+        log("[NativeWheelCapture] Requested four original motion buffers and matching pre-HUD scenes, at most one per presentation interval.");
+    }
+    catch (...) { warn("[NativeWheelCapture] Could not process capture request."); }
 }
 
 void on_present(api::command_queue *queue, api::swapchain *swapchain,
@@ -812,6 +1121,7 @@ void on_present(api::command_queue *queue, api::swapchain *swapchain,
             return;
         // This callback runs even while F7 globally disables ReShade effects.
         refresh_blur_controls(state);
+        poll_wheel_capture(state);
         if (!blur_verification_requested())
             return;
         for (unsigned i = 0; i < state.scene_captures.size(); ++i)
@@ -896,41 +1206,142 @@ void collect_scene_capture(DeviceState &state, unsigned index)
 {
     auto &pending = state.scene_captures[index - 1];
     native_blur::Capture capture;
-    pending.collected = true;
     if (!state.prehud->collect(index, capture))
     {
-        warn("[NativeBlurPreHUD] Scene readback unavailable; do not treat it as a paired capture.");
+        warn("[NativeBlurPreHUD] Scene readback unavailable; will retry after GPU completion.");
         return;
     }
+    pending.collected = true;
     try
     {
-        wchar_t executable[MAX_PATH]{};
-        GetModuleFileNameW(nullptr, executable, MAX_PATH);
-        const auto directory = std::filesystem::path(executable).parent_path() / L"NativeMotionCaptures";
+        const auto directory = capture_directory();
         std::filesystem::create_directories(directory);
-        char stem[64];
-        std::snprintf(stem, sizeof(stem), "NativePreHUD-%02u", index);
-        for (const bool after : {false, true})
-        {
-            const auto &pixels = after ? capture.after : capture.before;
-            std::ofstream out(directory / (std::string(stem) + (after ? "-SceneAfter.bin" : "-SceneBefore.bin")), std::ios::binary);
-            out.write(reinterpret_cast<const char *>(pixels.data()), static_cast<std::streamsize>(pixels.size()));
-            if (!out) throw std::runtime_error("Scene pixel file write failed");
-        }
-        std::ofstream metadata(directory / (std::string(stem) + ".json"));
-        metadata << "{\n  \"width\": " << capture.width << ",\n  \"height\": " << capture.height
+        const auto &stem = pending.stem;
+        const auto write_pixels = [&](const char *suffix, const auto &bytes) {
+            std::ofstream out(directory / (stem + suffix), std::ios::binary);
+            out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+            out.close();
+            if (!out) throw std::runtime_error("Capture pixel file write failed");
+        };
+        write_pixels("-SceneBefore.bin", capture.before);
+        write_pixels("-SceneAfter.bin", capture.after);
+        write_pixels("-Motion.bin", capture.motion);
+        if (!capture.wheel_mask.empty()) write_pixels("-WheelMask.bin", capture.wheel_mask);
+        if (!capture.wheel_depth.empty()) write_pixels("-WheelDepth.bin", capture.wheel_depth);
+        if (!capture.scene_depth.empty()) write_pixels("-SceneDepth.bin", capture.scene_depth);
+        if (!capture.wheel_parameters.empty()) write_pixels("-WheelParameters.bin", capture.wheel_parameters);
+        // Publish metadata last so a host analyzer never sees a partial burst item.
+        const auto temporary = directory / (stem + ".json.tmp");
+        std::ofstream metadata(temporary);
+        const auto &sample = pending.metadata;
+        metadata << std::setprecision(9) << std::boolalpha
+                 << "{\n  \"schema_version\": 1"
+                 << ",\n  \"width\": " << capture.width << ",\n  \"height\": " << capture.height
                  << ",\n  \"dxgi_format\": " << unsigned(capture.format)
+                 << ",\n  \"motion_width\": " << capture.motion_width
+                 << ",\n  \"motion_height\": " << capture.motion_height
+                 << ",\n  \"motion_dxgi_format\": " << unsigned(capture.motion_format)
+                 << ",\n  \"wheel_width\": " << capture.wheel_width
+                 << ",\n  \"wheel_height\": " << capture.wheel_height
+                 << ",\n  \"wheel_parameter_stride\": " << capture.wheel_parameter_stride
+                 << ",\n  \"wheel_parameter_bytes\": " << capture.wheel_parameters.size()
+                 << ",\n  \"wheel_mask_captured\": " << !capture.wheel_mask.empty()
+                 << ",\n  \"wheel_depth_captured\": " << !capture.wheel_depth.empty()
+                 << ",\n  \"scene_depth_captured\": " << !capture.scene_depth.empty()
+                 << ",\n  \"scene_depth_footprint_dxgi_format\": " << unsigned(capture.scene_depth_format)
+                 << ",\n  \"scene_depth_row_bytes\": " << capture.scene_depth_row_bytes
+                 << ",\n  \"depth_valid\": " << sample.depth_valid
+                 << ",\n  \"depth_resource_identity\": " << sample.depth_identity
+                 << ",\n  \"depth_inverted\": " << sample.depth_inverted
+                 << ",\n  \"depth_width\": " << sample.depth_texture.Width
+                 << ",\n  \"depth_height\": " << sample.depth_texture.Height
+                 << ",\n  \"depth_dxgi_format\": " << unsigned(sample.depth_texture.Format)
+                 << ",\n  \"depth_dimension\": " << unsigned(sample.depth_texture.Dimension)
+                 << ",\n  \"depth_mip_levels\": " << sample.depth_texture.MipLevels
+                 << ",\n  \"depth_array_size\": " << sample.depth_texture.DepthOrArraySize
+                 << ",\n  \"depth_sample_count\": " << sample.depth_texture.SampleDesc.Count
+                 << ",\n  \"depth_sample_quality\": " << sample.depth_texture.SampleDesc.Quality
+                 << ",\n  \"depth_flags\": " << unsigned(sample.depth_texture.Flags)
+                 << ",\n  \"depth_ffx_type\": " << sample.depth_ffx_type
+                 << ",\n  \"depth_ffx_state\": " << sample.depth_ffx_state
+                 << ",\n  \"depth_resource_state\": " << unsigned(sample.depth_state)
                  << ",\n  \"sequence\": " << pending.sequence
+                 << ",\n  \"dispatch_id\": " << sample.dispatch_id
+                 << ",\n  \"context_id\": " << sample.context_id
+                 << ",\n  \"recorded_present_interval\": " << pending.recorded_present_interval
+                 << ",\n  \"submitted_present_interval\": " << pending.submitted_present_interval
+                 << ",\n  \"captured_tick_ms\": " << pending.captured_tick_ms
                  << ",\n  \"submissions\": " << pending.submissions
-                 << ",\n  \"final_same_frame\": " << (pending.final_saved && pending.submissions == 1 ? "true" : "false")
-                 << "\n}\n";
+                 << ",\n  \"recording_replaced\": " << pending.recording_replaced
+                 << ",\n  \"source_same_dispatch\": true"
+                 << ",\n  \"blur_enabled\": " << pending.blur_applied
+                 << ",\n  \"wheel_correction_enabled\": " << pending.wheel_correction_enabled
+                 << ",\n  \"wheel_arcs_enabled\": " << pending.wheel_arcs_enabled
+                 << ",\n  \"wheel_source_depth_identity\": " << pending.wheel_source_depth
+                 << ",\n  \"final_same_frame\": " << (!pending.wheel && pending.final_saved && pending.submissions == 1)
+                 << ",\n  \"render_width\": " << sample.render_width
+                 << ",\n  \"render_height\": " << sample.render_height
+                 << ",\n  \"upscale_width\": " << sample.upscale_width
+                 << ",\n  \"upscale_height\": " << sample.upscale_height
+                 << ",\n  \"display_resolution_motion_vectors\": " << sample.display_resolution_motion_vectors
+                 << ",\n  \"jitter_cancellation\": " << sample.jitter_cancellation
+                 << ",\n  \"reset\": " << sample.reset;
+        const auto number = [&](const char *name, float value) {
+            metadata << ",\n  \"" << name << "\": ";
+            if (std::isfinite(value)) metadata << value;
+            else metadata << "null";
+        };
+        number("scale_x", sample.scale_x); number("scale_y", sample.scale_y);
+        number("jitter_x", sample.jitter_x); number("jitter_y", sample.jitter_y);
+        number("frame_time_ms", sample.frame_time_ms);
+        if (pending.wheel_correction_enabled && pending.submissions == 1)
+        {
+            const auto frame = wheel_runtime::coverage_for_frame(
+                reinterpret_cast<ID3D12Device *>(state.device->get_native()), pending.submitted_present_interval);
+            if (frame && frame->dispatch_id == sample.dispatch_id)
+            {
+                using wheel_runtime::Coverage;
+                constexpr std::pair<const char *, std::uint64_t Coverage::*> counters[] = {
+                    {"observed", &Coverage::observed},
+                    {"record_no_history", &Coverage::record_no_history},
+                    {"record_unsafe_seed", &Coverage::record_unsafe_seed},
+                    {"record_pool_full", &Coverage::record_pool_full},
+                    {"record_override_failed", &Coverage::record_override_failed},
+                    {"submitted", &Coverage::submitted},
+                    {"descriptor_mismatch", &Coverage::descriptor_mismatch},
+                    {"missing_history", &Coverage::missing_history},
+                    {"missing_prior_mesh", &Coverage::missing_prior_mesh},
+                    {"missing_prior", &Coverage::missing_prior},
+                    {"ambiguous_prior", &Coverage::ambiguous_prior},
+                    {"rejected_fit", &Coverage::rejected_fit},
+                    {"stationary", &Coverage::stationary},
+                    {"claim_conflict", &Coverage::claim_conflict},
+                    {"corrected", &Coverage::corrected},
+                    {"arc_submitted", &Coverage::arc_submitted},
+                    {"arc_valid", &Coverage::arc_valid},
+                    {"arc_invalid_projection", &Coverage::arc_invalid_projection},
+                };
+                metadata << ",\n  \"wheel_coverage\": {\n    \"frame_id\": " << frame->frame_id
+                         << ",\n    \"dispatch_id\": " << frame->dispatch_id
+                         << ",\n    \"valid_fsr\": " << frame->valid_fsr
+                         << ",\n    \"sequential\": " << frame->sequential
+                         << ",\n    \"history_observations\": " << frame->history_observations;
+                for (const auto &[name, count] : counters)
+                    metadata << ",\n    \"" << name << "\": " << frame->draws.*count;
+                metadata << "\n  }";
+            }
+        }
+        metadata << "\n}\n";
+        metadata.close();
         if (!metadata) throw std::runtime_error("Scene metadata file write failed");
-        char message[160];
-        std::snprintf(message, sizeof(message), "[NativeBlurPreHUD] capture=%u scene readbacks saved (%ux%u format=%u).",
-            index, capture.width, capture.height, unsigned(capture.format));
+        std::filesystem::rename(temporary, directory / (stem + ".json"));
+        char message[256];
+        std::snprintf(message, sizeof(message), "[NativeWheelCapture] Saved %s: scene=%ux%u motion=%ux%u format=%u submissions=%u.",
+            stem.c_str(), capture.width, capture.height, capture.motion_width, capture.motion_height,
+            unsigned(capture.motion_format), pending.submissions);
         log(message);
     }
-    catch (...) { warn("[NativeBlurPreHUD] Failed to write scene capture files."); }
+    catch (...) { warn("[NativeWheelCapture] Failed to write capture files; no completed JSON was published."); }
 }
 
 // ReShade 6.8's finish_present runs after the actual DXGI Present. Its effect
@@ -957,13 +1368,23 @@ void on_finish_present(api::command_queue *queue, api::swapchain *swapchain)
             warn("[NativeMotion] Presentation moved to another thread. Capture stopped to preserve submission ordering.");
         }
         if (state.queue_mismatch)
+        {
+            invalidate_wheel_mask(state);
+            wheel_trace::set_correction_active(state.device, false);
+            if (state.wheel_correction)
+                wheel_runtime::invalidate_history(reinterpret_cast<ID3D12Device *>(state.device->get_native()));
             return;
+        }
         const auto value = ++state.fence_value;
         auto *native = reinterpret_cast<ID3D12CommandQueue *>(queue->get_native());
         if (FAILED(native->Signal(state.fence.Get(), value)))
         {
             state.queue_mismatch = true;
             warn("[NativeMotion] GPU fence signal failed. Capture stopped.");
+            invalidate_wheel_mask(state);
+            wheel_trace::set_correction_active(state.device, false);
+            if (state.wheel_correction)
+                wheel_runtime::invalidate_history(reinterpret_cast<ID3D12Device *>(state.device->get_native()));
             return;
         }
         for (auto &slot : state.slots)
@@ -975,12 +1396,32 @@ void on_finish_present(api::command_queue *queue, api::swapchain *swapchain)
                 slot.phase = Phase::retiring;
                 slot.retirement = value;
             }
+        if (state.wheel_correction)
+        {
+            auto &frame = state.wheel_frame;
+            frame.frame_id = state.frames;
+            frame.valid = frame.valid && state.wheel_frame_samples == 1 &&
+                state.wheel_frame_submissions == 1 && !state.wheel_interval_ambiguous;
+            if (frame.valid && state.pending_wheel_surface)
+                frame.cleared_arc_mask = state.pending_wheel_surface->mask();
+            wheel_runtime::present(reinterpret_cast<ID3D12Device *>(state.device->get_native()), frame);
+            if (frame.cleared_arc_mask)
+                state.pending_wheel_surface->set_initialized(
+                    state.blur_enabled && state.blur_controls.wheel_arcs && !frame.reset && !frame.jitter_cancellation);
+            else
+                invalidate_wheel_mask(state);
+            state.pending_wheel_surface.reset();
+            frame = {};
+            state.wheel_frame_samples = state.wheel_frame_submissions = 0;
+            state.wheel_frame_command = 0;
+            state.wheel_interval_ambiguous = false;
+        }
         const auto completed_capture = state.fence->GetCompletedValue();
         if (completed_capture != UINT64_MAX)
             for (unsigned i = 0; i < state.scene_captures.size(); ++i)
             {
                 const auto &capture = state.scene_captures[i];
-                if (!capture.collected && capture.recording_replaced &&
+                if (!capture.collected && (!capture.wheel || state.wheel_remaining == 0) && capture.recording_replaced &&
                     capture.retirement != 0 && capture.retirement <= completed_capture)
                     collect_scene_capture(state, i + 1);
             }
@@ -1003,7 +1444,7 @@ void on_finish_present(api::command_queue *queue, api::swapchain *swapchain)
                 else if (slot.phase == Phase::quarantined)
                     ++quarantined;
             }
-            char message[512];
+            char message[768];
             std::snprintf(message, sizeof(message),
                 "[NativeMotion] status: dispatch=%llu accepted=%llu unknown_context=%llu unsupported=%llu copies=%llu shown=%llu dropped=%llu rejected=%llu bytes=%llu blur_frames=%llu allocation_failures=%llu held_reset=%u in_flight=%u recorded=%u quarantined=%u",
                 static_cast<unsigned long long>(stats.upscale_dispatches), static_cast<unsigned long long>(stats.samples),
@@ -1014,15 +1455,44 @@ void on_finish_present(api::command_queue *queue, api::swapchain *swapchain)
                 static_cast<unsigned long long>(state.allocation_failures),
                 held_reset, in_flight, recorded, quarantined);
             log(message);
+            if (state.wheel_correction)
+            {
+                const auto wheel = wheel_runtime::stats(reinterpret_cast<ID3D12Device *>(state.device->get_native()));
+                std::snprintf(message, sizeof(message),
+                    "[NativeWheelBlur] status: attempted=%llu pipelines=%llu admitted=%llu resolved=%llu observed=%llu substituted=%llu corrected=%llu replayed=%llu fallback=%llu wait_failures=%llu dropped=%llu unsupported=%llu bytes=%llu blocked=%d",
+                    static_cast<unsigned long long>(wheel.attempted), static_cast<unsigned long long>(wheel.pipeline_matches),
+                    static_cast<unsigned long long>(wheel.queue_admitted), static_cast<unsigned long long>(wheel.source_resolved),
+                    static_cast<unsigned long long>(wheel.observed), static_cast<unsigned long long>(wheel.substituted),
+                    static_cast<unsigned long long>(wheel.corrected), static_cast<unsigned long long>(wheel.replayed),
+                    static_cast<unsigned long long>(wheel.source_fallbacks), static_cast<unsigned long long>(wheel.wait_failures),
+                    static_cast<unsigned long long>(wheel.dropped), static_cast<unsigned long long>(wheel.unsupported_submissions),
+                    static_cast<unsigned long long>(wheel.upload_bytes_used), int(wheel.blocked));
+                log(message);
+                const auto &coverage = wheel.coverage;
+                std::snprintf(message, sizeof(message),
+                    "[NativeWheelArc] status: mask_draws=%llu replay_retained=%llu fence_failures=%llu arc_submitted=%llu arc_valid=%llu invalid_projection=%llu unverified_record_target=%llu unsafe_seed=%llu pool_full=%llu override_failed=%llu descriptor_mismatch=%llu missing_history=%llu missing_prior_mesh=%llu missing_prior=%llu ambiguous_prior=%llu rejected_fit=%llu stationary=%llu claim_conflict=%llu",
+                    static_cast<unsigned long long>(wheel.arc_recorded), static_cast<unsigned long long>(wheel.arc_replay_retained),
+                    static_cast<unsigned long long>(wheel.arc_fence_failures), static_cast<unsigned long long>(coverage.arc_submitted),
+                    static_cast<unsigned long long>(coverage.arc_valid), static_cast<unsigned long long>(coverage.arc_invalid_projection),
+                    static_cast<unsigned long long>(coverage.record_no_history),
+                    static_cast<unsigned long long>(coverage.record_unsafe_seed), static_cast<unsigned long long>(coverage.record_pool_full),
+                    static_cast<unsigned long long>(coverage.record_override_failed), static_cast<unsigned long long>(coverage.descriptor_mismatch),
+                    static_cast<unsigned long long>(coverage.missing_history), static_cast<unsigned long long>(coverage.missing_prior_mesh),
+                    static_cast<unsigned long long>(coverage.missing_prior), static_cast<unsigned long long>(coverage.ambiguous_prior),
+                    static_cast<unsigned long long>(coverage.rejected_fit), static_cast<unsigned long long>(coverage.stationary),
+                    static_cast<unsigned long long>(coverage.claim_conflict));
+                log(message);
+            }
             if (state.prehud)
             {
                 const auto native = state.prehud->stats();
                 std::snprintf(message, sizeof(message),
-                    "[NativeBlurPreHUD] status: recorded=%llu skipped=%llu allocation_failures=%llu enabled=%d display=%d shutter_angle=%.3f samples=%d radius=%.3f",
+                    "[NativeBlurPreHUD] status: recorded=%llu skipped=%llu allocation_failures=%llu enabled=%d display=%d shutter_angle=%.3f samples=%d radius=%.3f arc_frames=%llu arc_clears=%llu wheel_arcs=%d",
                     static_cast<unsigned long long>(native.drawn), static_cast<unsigned long long>(native.skipped),
                     static_cast<unsigned long long>(native.allocation_failures), int(state.blur_enabled),
                     state.blur_controls.display, double(state.blur_controls.shutter_angle), state.blur_controls.samples,
-                    double(state.blur_controls.max_radius));
+                    double(state.blur_controls.max_radius), static_cast<unsigned long long>(native.arc_frames),
+                    static_cast<unsigned long long>(native.arc_clears), int(state.blur_controls.wheel_arcs));
                 log(message);
             }
         }
@@ -1036,11 +1506,22 @@ void on_destroy_runtime(api::effect_runtime *runtime)
     const auto found = devices.find(runtime->get_device());
     if (found != devices.end() && found->second->runtime == runtime)
     {
+        invalidate_wheel_mask(*found->second);
+        wheel_trace::set_correction_active(found->second->device, false);
         set_valid(runtime, false);
         runtime->update_texture_bindings(semantic, {}, {});
         // A runtime reset is infrequent. Drain its effects before the display
         // allocation is detached; captures remain protected by their fences.
         found->second->queue->wait_idle();
+        if (found->second->wheel_correction)
+        {
+            wheel_runtime::invalidate_history(reinterpret_cast<ID3D12Device *>(found->second->device->get_native()));
+            found->second->wheel_frame = {};
+            found->second->wheel_frame_samples = found->second->wheel_frame_submissions = 0;
+            found->second->wheel_frame_command = 0;
+            found->second->wheel_interval_ambiguous = false;
+            found->second->pending_wheel_surface.reset();
+        }
         found->second->runtime = nullptr;
         found->second->blur_enabled = false;
         found->second->binding_dirty = true;
@@ -1061,6 +1542,17 @@ void on_destroy_device(api::device *device)
     if (found == devices.end())
         return;
     auto &state = *found->second;
+    invalidate_wheel_mask(state);
+    if (state.queue == nullptr)
+    {
+        // Startup probe devices never admitted a correction runtime or draws.
+        // Forget their pending upload identity before the real game device.
+        auto *native = reinterpret_cast<ID3D12Device *>(device->get_native());
+        wheel_runtime::shutdown_device(native);
+        wheel_mask::shutdown_device(native);
+        wheel_descriptors::shutdown_device(native);
+        wheel_pipeline_hooks::shutdown_device(native);
+    }
     const auto completed = state.fence ? state.fence->GetCompletedValue() : 0;
     bool retained = false;
     for (auto &slot : state.slots)

@@ -26,9 +26,11 @@ constexpr unsigned motion_width = 14, motion_height = 7;
 constexpr unsigned motion_alloc_width = 18, motion_alloc_height = 10;
 constexpr unsigned static_from = 18;
 constexpr auto output_format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+constexpr auto motion_format = DXGI_FORMAT_R16G16_FLOAT;
 constexpr auto read_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 constexpr auto output_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 using Pixel = std::array<std::uint16_t, 4>;
+using Motion = std::array<std::uint16_t, 2>;
 
 void check(bool valid, const char *what)
 {
@@ -45,6 +47,16 @@ Pixel color(unsigned x, unsigned y)
     return {static_cast<std::uint16_t>((x % 2) ? 0x4400 : 0x0000), // HDR values include 4.0.
             static_cast<std::uint16_t>((y % 2) ? 0x4000 : 0x0000), 0x3c00,
             static_cast<std::uint16_t>((x % 3) ? 0x3800 : 0x3400)};
+}
+
+Motion raw_motion(unsigned x, unsigned y)
+{
+    if (x >= motion_width || y >= motion_height)
+        return {0x4600, 0x4600};
+    // Check signed zero and a NaN payload without changing the fixture's static region.
+    const std::uint16_t horizontal = x < 11 ? (y % 2 ? 0x4500 : 0x4600) : (x == 13 ? 0x7e55 : 0);
+    const std::uint16_t vertical = (x + y) % 2 ? 0x8000 : 0;
+    return {horizontal, vertical};
 }
 
 void transition(ID3D12GraphicsCommandList *list, ID3D12Resource *resource,
@@ -155,6 +167,17 @@ void verify(const native_blur::Capture &capture, const Transfer &output_readback
     check(capture.width == output_width && capture.height == output_height && capture.format == output_format &&
         capture.before.size() == output_width * output_height * sizeof(Pixel) &&
         capture.after.size() == capture.before.size(), "capture dimensions, format and packed rows");
+    check(capture.motion_width == motion_width && capture.motion_height == motion_height &&
+        capture.motion_format == motion_format && capture.motion.size() == motion_width * motion_height * sizeof(Motion),
+        "capture active motion dimensions, RG16F format and packed rows");
+    for (unsigned y = 0; y < motion_height; ++y)
+        for (unsigned x = 0; x < motion_width; ++x)
+        {
+            const auto expected = raw_motion(x, y);
+            const auto offset = (y * motion_width + x) * sizeof(Motion);
+            check(std::memcmp(capture.motion.data() + offset, expected.data(), sizeof(Motion)) == 0,
+                "read back raw motion bits exactly");
+        }
 
     void *mapping = nullptr;
     check(SUCCEEDED(output_readback.buffer->Map(0, nullptr, &mapping)), "map in-place result");
@@ -233,13 +256,11 @@ int main()
             }
         });
     const auto motion = make_texture(device.Get(), list.Get(), motion_alloc_width, motion_alloc_height,
-        DXGI_FORMAT_R32G32_FLOAT, [](unsigned char *row, unsigned y) {
-            auto *values = reinterpret_cast<float *>(row);
+        motion_format, [](unsigned char *row, unsigned y) {
             for (unsigned x = 0; x < motion_alloc_width; ++x)
             {
-                const bool padding = x >= motion_width || y >= motion_height;
-                values[x * 2] = padding || x < 11 ? 6.f : 0.f;
-                values[x * 2 + 1] = padding ? 6.f : 0.f;
+                const auto value = raw_motion(x, y);
+                std::memcpy(row + x * sizeof(Motion), value.data(), sizeof(Motion));
             }
         });
 
@@ -283,7 +304,24 @@ int main()
     execute(device.Get(), queue.Get(), list.Get());
 
     native_blur::Capture capture, consumer;
-    check(engine.collect(1, capture) && !engine.collect(1, capture), "collect captured frame exactly once");
+    check(engine.collect(1, capture) && !engine.capture_recorded(1) && !engine.collect(1, capture),
+        "collect captured frame exactly once and release the slot");
     check(engine.collect(2, consumer) && consumer.after == capture.after, "same-list texture consumer sees the blurred output");
+    check(consumer.before == capture.after, "same-list capture sees the preceding dispatch's copied-back output");
     verify(capture, output_readback);
+
+    check(SUCCEEDED(allocator->Reset()), "reset allocator for capture-only recording");
+    check(SUCCEEDED(list->Reset(allocator.Get(), nullptr)), "reset list for capture-only recording");
+    controls.enabled = false;
+    sample.reset = true;
+    check(engine.record(list.Get(), sample, motion.resource.Get(), 0, controls, 1), "reuse the slot for a capture-only reset frame");
+    check(!engine.record(list.Get(), sample, motion.resource.Get(), 0, controls, 1), "keep a pending capture reserved");
+    execute(device.Get(), queue.Get(), list.Get());
+    check(SUCCEEDED(allocator->Reset()), "reset allocator after capture-only recording");
+    check(SUCCEEDED(list->Reset(allocator.Get(), nullptr)), "replace the capture-only recording");
+    native_blur::Capture capture_only;
+    check(engine.collect(1, capture_only) && capture_only.before == capture.after &&
+        capture_only.after == capture_only.before && capture_only.motion == capture.motion && engine.stats().drawn == 2,
+        "capture the current output and raw motion without running blur");
+    check(SUCCEEDED(list->Close()), "close the replacement list");
 }

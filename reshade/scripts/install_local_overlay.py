@@ -15,7 +15,13 @@ def digest(path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--game-dir', type=Path, required=True)
-    parser.add_argument('--reshade-dll', type=Path, required=True)
+    parser.add_argument('--reshade-dll', type=Path)
+    parser.add_argument('--addon-only', action='store_true',
+                        help='update only the add-on, preserving existing ReShade, shaders, preset and settings')
+    parser.add_argument('--wheel-blur', action='store_true',
+                        help='enable the experimental rigid-wheel motion correction on the next game launch')
+    parser.add_argument('--update-blur-shader', action='store_true',
+                        help='also update blur controls during an add-on-only install, preserving the preset')
     parser.add_argument('--backup-root', type=Path, required=True)
     parser.add_argument('--settings-file', type=Path)
     parser.add_argument(
@@ -27,6 +33,10 @@ def main():
     game = args.game_dir.resolve()
     if not (game / 'GTA5_Enhanced.exe').is_file():
         parser.error('Target is not a GTA V Enhanced executable directory')
+    if not args.addon_only and args.reshade_dll is None:
+        parser.error('--reshade-dll is required unless --addon-only is used')
+    if args.addon_only and not (game / 'dxgi.dll').is_file():
+        parser.error('--addon-only requires an existing ReShade installation')
     addon = root / 'build-windows/NativeMotionVectors.addon64'
     vectors_shader = root / 'shaders/NativeMotionVectors.fx'
     blur_shader = root / 'shaders/NativeMotionBlur.fx'
@@ -34,8 +44,8 @@ def main():
     shaders = [vectors_shader]
     if blur_preset is not None or blur_shader.is_file():
         shaders.append(blur_shader)
-    sources = [args.reshade_dll, addon, *shaders]
-    if blur_preset is not None:
+    sources = [addon] if args.addon_only else [args.reshade_dll, addon, *shaders]
+    if blur_preset is not None and not args.addon_only:
         sources.append(blur_preset)
     for source in sources:
         if not source.is_file():
@@ -73,13 +83,17 @@ NativeMotionShowStatus=1
 '''
     if blur_preset is not None:
         preset = blur_preset.read_bytes()
-    targets = {
+    targets = {'NativeMotionVectors.addon64': addon.read_bytes()} if args.addon_only else {
         'dxgi.dll': args.reshade_dll.read_bytes(),
         'NativeMotionVectors.addon64': addon.read_bytes(),
         **{f'reshade-shaders/Shaders/{shader.name}': shader.read_bytes() for shader in shaders},
         'ReShade.ini': reshade.encode(),
         'NativeMotionPreset.ini': preset,
     }
+    if args.wheel_blur:
+        targets['NativeWheelBlur.enable'] = b'Enable experimental rigid-wheel motion correction at startup.\n'
+    if args.update_blur_shader:
+        targets['reshade-shaders/Shaders/NativeMotionBlur.fx'] = blur_shader.read_bytes()
     backup = args.backup_root.resolve() / datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     backup.mkdir(parents=True, exist_ok=False)
     journal = {'game_directory': str(game), 'created_utc': datetime.now(timezone.utc).isoformat(), 'files': []}

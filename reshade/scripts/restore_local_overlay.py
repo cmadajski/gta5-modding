@@ -16,6 +16,8 @@ import stat
 ARTIFACTS = {
     Path('dxgi.dll'),
     Path('NativeMotionVectors.addon64'),
+    Path('NativeWheelTrace.enable'),
+    Path('NativeWheelBlur.enable'),
     Path('reshade-shaders/Shaders/NativeMotionBlur.fx'),
     Path('reshade-shaders/Shaders/NativeMotionVectors.fx'),
     Path('ReShade.ini'),
